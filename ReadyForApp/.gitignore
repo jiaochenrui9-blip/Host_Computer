@@ -1,0 +1,19 @@
+# IDE settings
+.idea/
+.vscode/
+
+# CMake and compiler output
+cmake-build-*/
+build/
+out/
+compile_commands.json
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+
+# OS files
+Thumbs.db
+Desktop.ini
