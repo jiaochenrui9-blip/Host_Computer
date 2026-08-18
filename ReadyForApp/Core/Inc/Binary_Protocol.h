@@ -24,14 +24,14 @@ typedef struct
     uint8_t payload[BINARY_PROTOCOL_MAX_PAYLOAD];
 } BinaryProtocolFrame;
 
-/* 初始化协议接收器，并启动 UART 单字节中断接收。 */
+/* 初始化协议接收器，并启动 UART 循环 DMA 接收。 */
 void BinaryProtocol_Init(UART_HandleTypeDef *huart);
 
-/* 在主循环调用，用于超时丢弃未接收完整的帧。 */
+/* 在主循环调用，处理 DMA 新数据并用于超时丢弃未接收完整的帧。 */
 void BinaryProtocol_Task(void);
 
-/* 由 HAL_UART_RxCpltCallback 和 HAL_UART_ErrorCallback 直接调用。 */
-void BinaryProtocol_RxCpltCallback(UART_HandleTypeDef *huart);
+/* 由 HAL_UARTEx_RxEventCallback 和 HAL_UART_ErrorCallback 直接调用。 */
+void BinaryProtocol_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size);
 void BinaryProtocol_ErrorCallback(UART_HandleTypeDef *huart);
 
 /* 取出一帧已接收且地址匹配的完整帧；队列为空时返回 0。 */

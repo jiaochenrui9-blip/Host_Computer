@@ -5,7 +5,9 @@
 enum
 {
     BINARY_FRAME_QUEUE_SIZE = 4U,
-    BINARY_INTER_BYTE_TIMEOUT_MS = 100U
+    BINARY_INTER_BYTE_TIMEOUT_MS = 100U,
+    BINARY_DMA_RX_BUFFER_SIZE = 256U,
+    BINARY_DMA_EVENT_QUEUE_SIZE = 4U
 };
 
 typedef enum
@@ -22,7 +24,7 @@ typedef enum
 } BinaryRxState;
 
 static UART_HandleTypeDef *binary_uart = NULL;
-static uint8_t rx_byte = 0U;
+static uint8_t rx_dma_buffer[BINARY_DMA_RX_BUFFER_SIZE];
 static volatile BinaryRxState rx_state = RX_WAIT_HEADER_1;
 static BinaryProtocolFrame rx_working_frame;
 static BinaryProtocolFrame rx_frame_queue[BINARY_FRAME_QUEUE_SIZE];
@@ -33,6 +35,13 @@ static volatile uint8_t rx_queue_read = 0U;
 static volatile uint8_t rx_queue_write = 0U;
 static volatile uint8_t rx_queue_count = 0U;
 static volatile uint32_t rx_last_byte_tick = 0U;
+static uint16_t rx_dma_last_position = 0U;
+static uint16_t rx_dma_event_position[BINARY_DMA_EVENT_QUEUE_SIZE];
+static uint8_t rx_dma_event_is_full[BINARY_DMA_EVENT_QUEUE_SIZE];
+static volatile uint8_t rx_dma_event_read = 0U;
+static volatile uint8_t rx_dma_event_write = 0U;
+static volatile uint8_t rx_dma_event_count = 0U;
+static volatile uint8_t rx_dma_restart_pending = 0U;
 
 static uint16_t BinaryProtocol_CRC16Update(uint16_t crc, uint8_t byte)
 {
@@ -67,12 +76,58 @@ static uint8_t BinaryProtocol_IsLocalAddress(uint8_t address)
            (address == BINARY_PROTOCOL_BROADCAST_ADDRESS);
 }
 
-static void BinaryProtocol_RestartReceive(void)
+static HAL_StatusTypeDef BinaryProtocol_StartReceive(void)
 {
-    if (binary_uart != NULL)
+    HAL_StatusTypeDef status;
+
+    if (binary_uart == NULL)
     {
-        (void)HAL_UART_Receive_IT(binary_uart, &rx_byte, 1U);
+        return HAL_ERROR;
     }
+
+    status = HAL_UARTEx_ReceiveToIdle_DMA(binary_uart,
+                                          rx_dma_buffer,
+                                          BINARY_DMA_RX_BUFFER_SIZE);
+    if (status == HAL_OK)
+    {
+        __HAL_DMA_DISABLE_IT(binary_uart->hdmarx, DMA_IT_HT);
+    }
+
+    return status;
+}
+
+static void BinaryProtocol_ProcessDmaBytes(uint16_t position, uint8_t is_full)
+{
+    uint16_t index;
+
+    if (is_full != 0U)
+    {
+        for (index = rx_dma_last_position; index < BINARY_DMA_RX_BUFFER_SIZE; index++)
+        {
+            (void)BinaryProtocol_InputByte(rx_dma_buffer[index]);
+        }
+    }
+    else if (position > rx_dma_last_position)
+    {
+        for (index = rx_dma_last_position; index < position; index++)
+        {
+            (void)BinaryProtocol_InputByte(rx_dma_buffer[index]);
+        }
+    }
+    else if (position < rx_dma_last_position)
+    {
+        for (index = rx_dma_last_position; index < BINARY_DMA_RX_BUFFER_SIZE; index++)
+        {
+            (void)BinaryProtocol_InputByte(rx_dma_buffer[index]);
+        }
+
+        for (index = 0U; index < position; index++)
+        {
+            (void)BinaryProtocol_InputByte(rx_dma_buffer[index]);
+        }
+    }
+
+    rx_dma_last_position = (is_full != 0U) ? 0U : position;
 }
 
 void BinaryProtocol_Init(UART_HandleTypeDef *huart)
@@ -82,32 +137,110 @@ void BinaryProtocol_Init(UART_HandleTypeDef *huart)
     rx_queue_write = 0U;
     rx_queue_count = 0U;
     rx_last_byte_tick = 0U;
+    rx_dma_last_position = 0U;
+    rx_dma_event_read = 0U;
+    rx_dma_event_write = 0U;
+    rx_dma_event_count = 0U;
+    rx_dma_restart_pending = 0U;
     memset(&rx_working_frame, 0, sizeof(rx_working_frame));
     memset(rx_frame_queue, 0, sizeof(rx_frame_queue));
+    memset(rx_dma_buffer, 0, sizeof(rx_dma_buffer));
+    memset(rx_dma_event_position, 0, sizeof(rx_dma_event_position));
+    memset(rx_dma_event_is_full, 0, sizeof(rx_dma_event_is_full));
     BinaryProtocol_ResetParser();
-    BinaryProtocol_RestartReceive();
+    (void)BinaryProtocol_StartReceive();
 }
 
 void BinaryProtocol_Task(void)
 {
+    uint16_t position;
+    uint8_t is_full;
+    uint32_t primask;
+
+    if (binary_uart == NULL)
+    {
+        return;
+    }
+
+    if (rx_dma_restart_pending != 0U)
+    {
+        (void)HAL_UART_AbortReceive(binary_uart);
+        BinaryProtocol_ResetParser();
+        rx_dma_last_position = 0U;
+        rx_dma_event_read = 0U;
+        rx_dma_event_write = 0U;
+        rx_dma_event_count = 0U;
+        if (BinaryProtocol_StartReceive() == HAL_OK)
+        {
+            rx_dma_restart_pending = 0U;
+        }
+        return;
+    }
+
+    for (;;)
+    {
+        primask = __get_PRIMASK();
+        __disable_irq();
+        if (rx_dma_event_count == 0U)
+        {
+            if (primask == 0U)
+            {
+                __enable_irq();
+            }
+            break;
+        }
+
+        position = rx_dma_event_position[rx_dma_event_read];
+        is_full = rx_dma_event_is_full[rx_dma_event_read];
+        rx_dma_event_read = (uint8_t)((rx_dma_event_read + 1U) % BINARY_DMA_EVENT_QUEUE_SIZE);
+        rx_dma_event_count--;
+        if (primask == 0U)
+        {
+            __enable_irq();
+        }
+        BinaryProtocol_ProcessDmaBytes(position, is_full);
+    }
+
+    primask = __get_PRIMASK();
     __disable_irq();
     if ((rx_state != RX_WAIT_HEADER_1) &&
         ((HAL_GetTick() - rx_last_byte_tick) > BINARY_INTER_BYTE_TIMEOUT_MS))
     {
         BinaryProtocol_ResetParser();
     }
-    __enable_irq();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
 }
 
-void BinaryProtocol_RxCpltCallback(UART_HandleTypeDef *huart)
+void BinaryProtocol_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
-    if ((binary_uart == NULL) || (huart != binary_uart))
+    HAL_UART_RxEventTypeTypeDef event_type;
+
+    if ((binary_uart == NULL) || (huart != binary_uart) ||
+        (size == 0U) || (size > BINARY_DMA_RX_BUFFER_SIZE))
     {
         return;
     }
 
-    (void)BinaryProtocol_InputByte(rx_byte);
-    BinaryProtocol_RestartReceive();
+    event_type = HAL_UARTEx_GetRxEventType(huart);
+    if ((event_type != HAL_UART_RXEVENT_IDLE) &&
+        (event_type != HAL_UART_RXEVENT_TC))
+    {
+        return;
+    }
+
+    if (rx_dma_event_count >= BINARY_DMA_EVENT_QUEUE_SIZE)
+    {
+        rx_dma_restart_pending = 1U;
+        return;
+    }
+
+    rx_dma_event_position[rx_dma_event_write] = size;
+    rx_dma_event_is_full[rx_dma_event_write] = (event_type == HAL_UART_RXEVENT_TC) ? 1U : 0U;
+    rx_dma_event_write = (uint8_t)((rx_dma_event_write + 1U) % BINARY_DMA_EVENT_QUEUE_SIZE);
+    rx_dma_event_count++;
 }
 
 void BinaryProtocol_ErrorCallback(UART_HandleTypeDef *huart)
@@ -117,11 +250,7 @@ void BinaryProtocol_ErrorCallback(UART_HandleTypeDef *huart)
         return;
     }
 
-    BinaryProtocol_ResetReceiver();
-    if (huart->RxState == HAL_UART_STATE_READY)
-    {
-        BinaryProtocol_RestartReceive();
-    }
+    rx_dma_restart_pending = 1U;
 }
 
 uint8_t BinaryProtocol_ReadFrame(BinaryProtocolFrame *frame)
